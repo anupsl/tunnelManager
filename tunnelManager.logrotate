@@ -1,0 +1,11 @@
+/var/log/capillary/tunnelManager/tunnelmanager.log /var/log/capillary/tunnelManager/tunnelmanager.out {
+        daily
+        rotate 20
+        compress
+        delaycompress
+        missingok
+        copytruncate
+        create 644 root root
+        su root root
+}
+

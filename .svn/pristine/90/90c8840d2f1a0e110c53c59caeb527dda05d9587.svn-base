@@ -1,0 +1,340 @@
+from flask import Flask, request
+from threading import Thread
+from logg import Logger, log, Constants
+import json, traceback, time, os, subprocess
+import sys, signal, socket, psutil, imp
+        
+app = Flask(__name__)
+
+#os.environ['SSHPASS'] = Constants.passWord
+FNULL = open(os.devnull, 'w')   
+
+class tunnelManager(Thread):
+    def __init__(self, localPort, values):
+        #self.exeString = 'sshpass -e ssh -L '+str(localPort)+':'+str(values['ip'])+':'+str(values['remotePort'])+' tunnel@'+Constants.jumpBox[values['cluster']]
+        self.exeString = 'ssh -L '+str(localPort)+':'+str(values['ip'])+':'+str(values['remotePort'])+' '+Constants.jumpBox[values['cluster']]
+        Thread.__init__(self)   
+        self.daemon = True     
+        
+    def run(self):
+        try:    
+            self.proc = subprocess.Popen(self.exeString, shell=True, preexec_fn=os.setsid, stdout=FNULL, stderr=subprocess.STDOUT)
+        except:            
+            log(traceback.format_exc())   
+                    
+    def shutdown(self):
+        log('shutdown issued. killing ', self.proc.pid)
+        os.killpg(self.proc.pid, signal.SIGTERM)
+        
+
+              
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def allReq(path):
+    req = request.args
+    log('request: ', req)
+    if 'command' in req and ('cluster' in req or 'port' in req):
+        cmd = req['command'].lower()
+        if 'cluster' in req:
+            if not req['cluster'] in Constants.configuredPort:
+                return 'Invalid cluster\n'
+        if 'port' in req and cmd != 'reload':
+            if not req['port'] in Constants.config:
+                return 'Port '+req['port']+' not found\n'                
+        if cmd == 'start':
+            return start(req)
+        elif cmd == 'restart': # To block multiple restart request on same port
+            if 'port' in req:
+                currTime = int(time.time())
+                lastMod = Constants.config[req['port']]['lastModifiedTime']
+                if currTime - lastMod < 40:            
+                    return 'Restart already issued in last 40secs. Ignoring the request\n'
+                if currTime - lastMod > 1200:
+                    Constants.config[req['port']]['retryAttempts'] = 0
+                else:
+                    Constants.config[req['port']]['retryAttempts'] += 1
+                if Constants.config[req['port']]['retryAttempts'] > 9:                
+                    return 'Too many restart in last 20mins'
+            Constants.config[req['port']]['lastModifiedTime'] = currTime           
+            return restart(req)                
+        elif cmd == 'reload':
+            return reloadRestart(req)
+        elif cmd == 'stop':
+            return stop(req)
+        elif cmd == 'getip':
+            return getIP(req)
+        elif cmd == 'list':
+            return listMachines(req)
+        else:
+            return status(req)
+    elif 'command' in req:
+        if req['command'] == 'shutdown':
+            return shutdownServer()                
+        else:
+            return 'Invalid request\n'                            
+    else:
+        return 'Invalid request\n'        
+
+def shutdownServer():
+    for cu, ports in Constants.configuredPort.items():
+        if ports != []:
+            req = {'cluster': cu, 'command': 'stop'}
+            stop(req)
+    time.sleep(1)
+    func = request.environ.get('werkzeug.server.shutdown')
+    if func is None:
+        raise RuntimeError('Not running with the Werkzeug Server')
+    func()
+    log('Shutting down server')
+    return 'Shutting down server\n'   
+
+def start(req):
+    if 'port' in req:
+        values = Constants.config[req['port']]
+        if not values['obj']:
+            log('Starting tunnel on port: ', req['port'], ' ',values)
+            values['lastModifiedTime'] = int(time.time())
+            values['obj'] = startTunnel(req['port'], values)  
+            clu = values['cluster']
+            Constants.configuredPort[clu].append(req['port'])  
+            return 'Started\n'
+        else:
+            return 'Tunnel is already running for '+req['port']+' port\n'                            
+    else:
+        clu = req['cluster']
+        if Constants.configuredPort[clu] == []:
+            log('Starting tunnel on cluster: ', clu)                
+            for k, v in Constants.config.items():
+                if v['cluster'] == clu: 
+                    v['obj'] = startTunnel(k, v) 
+                    v['lastModifiedTime'] = int(time.time())             
+                    Constants.configuredPort[clu].append(k)
+                    time.sleep(0.5)
+            time.sleep(10)
+            log('Tunnel setup for cluster: ', clu)
+            return 'Started\n'                        
+        else:
+            return 'Tunnel is already running for '+clu+' cluster\n'          
+               
+
+def stop(req):
+    if 'port' in req:
+        values = Constants.config[req['port']]
+        if values['obj']:
+            log('Stopping tunnel on port: ', req['port'], ' ',values) 
+            try:           
+                values['obj'].shutdown()
+                values['obj'] = False
+                Constants.configuredPort[values['cluster']].remove(req['port'])
+                return 'Stopped\n'
+            except:
+                log(traceback.format_exc())                               
+                return 'error \n'                
+        else:
+            return 'Tunnel is already stopped for '+req['port']+' port\n'                            
+    else:
+        clu = req['cluster']
+        if Constants.configuredPort[clu] == []:
+            return 'Tunnel is already stopped for '+clu+' cluster\n' 
+        else:
+            log('Stopping tunnel on cluster: ', clu)              
+            for k in Constants.configuredPort[clu]:
+                v = Constants.config[k] 
+                if v['obj']:
+                    v['obj'].shutdown()
+                    v['obj'] = False    
+            Constants.configuredPort[clu] = []            
+            return 'Stopped\n' 
+
+def reloadRestart(req):
+    newConfig = fetchConfig()
+    if 'port' in req:
+        if req['port'] in Constants.config:
+            stop(req)
+            if req['port'] in newConfig:
+                Constants.config[req['port']] = newConfig[req['port']]
+                start(req)            
+                return 'Tunnel reloaded the config for '+req['port']+' port\n'                
+            else:
+                return 'Port '+req['port']+'not found in new config\n'
+        else:
+            if req['port'] in newConfig:
+                Constants.config[req['port']] = newConfig[req['port']]
+                start(req)   
+                return 'Tunnel reloaded on the new port'+req['port']+'\n'      
+            else:
+                return 'Port '+req['port']+' not found\n'
+    else:
+        clu = req['cluster']
+        portList = []                
+        for k, v in newConfig.items():
+            if v['cluster'] == clu:
+                portList.append(k)              
+        if portList == []:
+            return 'No ports found for the selected cluster in the new config\n'
+        else:
+            if Constants.configuredPort[clu] != []:
+                stop(req)               
+            for k, v in Constants.config.items():
+                if v['cluster'] == clu:
+                    del Constants.config[k]                     
+            for k in portList:
+                Constants.config[k] = newConfig[k]
+                Constants.config[k]['obj'] = False            
+            start(req)       
+            return 'Tunnel restarted for cluster'+clu+' after reloading\n'
+            
+                    
+def restart(req):
+    stop(req)
+    start(req)     
+    return 'Tunnel restarted on port '+req['port']+'\n'               
+
+def status(req):
+    if 'port' in req:
+        values = Constants.config[req['port']]
+        if values['obj']:
+            proc = psutil.Process(values['obj'].proc.pid)
+            if proc.status() == 'sleeping' or proc.status() == 'running':
+                msg = 'Tunnel is running for port '+req['port']+' for cluster:'+Constants.config[req['port']]['cluster']+' server info:'+Constants.config[req['port']]['comment']+'\n'
+                return msg
+            else:
+                values['obj'] = False
+                Constants.configuredPort[values['cluster']].remove(req['port'])
+                return 'Tunnel is stopped for port '+req['port']+'\n'                                                             
+        else:
+            return 'Tunnel is stopped for port '+req['port']+'\n'                                             
+    else:
+        clu = req['cluster']
+        if Constants.configuredPort[clu] == []:
+            return 'No tunnel found for '+clu+' cluster\n' 
+        else:
+            msg = 'Tunnel is running for '+clu+' cluster on following ports:\n'
+            for p in Constants.configuredPort[clu]:
+                msg += str(p)+' ip: '+Constants.config[p]['ip']+' server info: '+Constants.config[p]['comment']+'\n'
+            return msg
+
+
+def  listMachines(req):
+    if 'cluster' in req:
+        clu = req['cluster'].lower()
+    else:
+        clu = False
+    out = ''
+    for k, v in Constants.config.items():
+        if clu:
+            if v['cluster'] == clu:
+                out += "%-30s %-8s %15s \n" % (v['ip'], k, v['comment'])
+        else:
+            out += "%-30s %-8s %-8s %15s \n" % (v['ip'], k, v['cluster'], v['comment'])
+    return out
+
+def getIP(req):
+    if 'port' in req:
+        port = req['port']
+        if port in Constants.config:
+            ip = Constants.config[port]['ip']
+            return json.dumps({'status': 'success', 'message': ip})
+        else:
+            return json.dumps({'status': 'failure', 'message': 'port not foud'}) 
+    else:
+        return json.dumps({'status': 'failure', 'message': 'port is required'})
+
+def startTunnel(k, v):
+    try:
+        a = tunnelManager(k, v)
+        a.start()
+        return a
+    except:
+        log(traceback.format_exc())
+        return False
+
+def fetchConfig():
+    #with open("config.json") as json_file:
+    #    config = json.load(json_file)
+    tmp = imp.load_source('config', 'config.py')
+    config = tmp.config
+    for k, v in config.items():
+        v['cluster'] = v['cluster'].lower()
+        v['obj'] = False
+        v['retryAttempts'] = 0
+        v['lastModifiedTime'] = 1436003952
+    return config
+
+
+def socketConn(ip):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5)
+    result = sock.connect_ex((ip, 22))
+    if result == 0:
+        return True
+    else:
+        return False
+
+def startAllTunnels():
+    #load config
+    log('Verifying jumper connection...')
+    for k, v in Constants.jumpBox.items():
+        if not socketConn(v):
+            if v != 'jumper.capillarytech.cn.com':
+                log('Error connecting to jumper box ', k,' ',v)
+                #sys.exit(0)
+    Constants.config = fetchConfig()
+    log('Starting all tunnels ...')
+                
+
+if __name__ == "__main__":
+    Logger()
+    startAllTunnels()
+    app.run(port=6000)#, debug=True, use_reloader=False)
+
+
+'''
+   
+
+ex: 
+curl "http://127.0.0.1:6000/tunnel?command=start&cluster=nightly"
+curl "http://127.0.0.1:6000/tunnel?command=restart&port=8911"
+
+supported command:
+    start
+    stop
+    restart
+    reload
+    shutdown
+    
+cluster:
+    nightly
+    staging
+    us
+    eu
+    india
+    more
+    china
+    mumbai 
+
+
+
+
+from tunnel import setupTunnel
+from multiprocessing import Process
+
+class tunnelManager_withParamiko(Process):
+    def __init__(self, localPort, values):
+        self.localPort = int(localPort)
+        self.remotePort = int(values['remotePort'])
+        self.ip = values['ip']
+        self.jmpbox = Constants.jumpBox[values['cluster']]
+        Process.__init__(self)
+        
+    def run(self): 
+        try:   
+            setupTunnel(self.jmpbox, Constants.userName, Constants.passWord, self.ip, self.remotePort, self.localPort)
+        except:
+            log(traceback.format_exc())              
+        
+    def shutdown(self):
+        self.terminate()
+        self.join()
+   
+'''
